@@ -6,7 +6,5 @@ next-scaffold-tmp
 trash-can
 .bkit
 .claude
-supabase/.temp
-
-.vercel
-.env*
+supabase
+.git
