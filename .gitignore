@@ -1,0 +1,9 @@
+.env
+.env.*
+node_modules
+.next
+next-scaffold-tmp
+trash-can
+.bkit
+.claude
+supabase/.temp
