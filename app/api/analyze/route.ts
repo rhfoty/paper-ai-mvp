@@ -20,7 +20,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const SUMMARY_SYSTEM_PROMPT = `당신은 생명공학·의약학 분야 대학원생을 돕는 논문 요약 도우미입니다.
 반드시 지켜야 할 규칙:
 1. 아래 사용자 메시지로 주어진 논문 텍스트에 없는 내용은 절대 추측해서 넣지 않는다 (환각 금지).
-2. 응답은 500자 이내의 한국어로 작성한다.
+2. 응답은 450자 이내의 한국어로 작성하고, 반드시 문장을 완결해서 끝낸다. (화면에는 500자까지만 표시되므로 450자를 넘기면 문장이 잘린다.)
 3. 핵심 기술 용어·지표·약어·포맷 명칭은 한국어로 번역하지 않고 영어 원문 그대로 사용하고, 문장 구조만 자연스러운 한국어로 작성한다.
 4. 논문의 연구 목적, 방법, 핵심 결과를 중심으로 핵심만 요약한다.`;
 
@@ -35,10 +35,24 @@ async function generateSummary(pagedText: string): Promise<string> {
   });
 
   const summary = completion.choices[0]?.message?.content?.trim() ?? "";
-  // 모델이 글자 수 지시를 넘길 경우를 대비한 최종 안전장치
-  return summary.length > SUMMARY_MAX_LENGTH
-    ? summary.slice(0, SUMMARY_MAX_LENGTH)
-    : summary;
+  // 모델이 글자 수 지시를 넘길 경우를 대비한 최종 안전장치.
+  // 그냥 자르면 문장 중간이 끊겨서("...이루어진 점" 처럼) 읽기 어려우므로
+  // 500자 안에서 마지막으로 완결된 문장까지만 남긴다.
+  return trimToSentenceBoundary(summary, SUMMARY_MAX_LENGTH);
+}
+
+function trimToSentenceBoundary(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+
+  const cut = text.slice(0, maxLength);
+  const lastSentenceEnd = Math.max(
+    cut.lastIndexOf("."),
+    cut.lastIndexOf("!"),
+    cut.lastIndexOf("?"),
+  );
+
+  // 문장 끝을 너무 앞에서 찾으면 내용이 과하게 날아가므로, 그럴 때는 그대로 자른다.
+  return lastSentenceEnd > maxLength / 2 ? cut.slice(0, lastSentenceEnd + 1) : cut;
 }
 
 export type DetailedSummary = {
@@ -48,41 +62,67 @@ export type DetailedSummary = {
   conclusion: string;
 };
 
-// DESIGN.md 흐름1 ⑤: 500자 핵심 요약과 별도의 두 번째 OpenAI 호출로 4단계 상세 요약을 생성한다.
-// 주의: 필드 설명을 JSON 예시 값 자리에 넣으면 모델이 설명 문구 자체를 그대로 복사하는
-// 문제가 있어(직접 테스트로 확인), 필드 설명과 응답 형식 예시를 분리해서 지시한다.
-const DETAILED_SUMMARY_SYSTEM_PROMPT = `당신은 생명공학·의약학 분야 대학원생을 돕는 논문 요약 도우미입니다.
+// DESIGN.md 흐름1 ⑤: 500자 핵심 요약과 별도로 4단계 상세 요약을 생성한다.
+// 주의: 4개 항목을 JSON 하나로 한 번에 받으면, keyTerms가 길어질 때 나머지 3개 항목이
+// 빈 문자열로 밀려나는 현상을 실제로 확인했다(finish_reason은 stop, 잘림이 아님).
+// 그래서 항목별로 호출을 분리해 병렬 실행한다. 각 항목이 토큰 예산을 온전히 쓰므로
+// 더 길고 깊게 나오고, 한 항목이 다른 항목을 굶기는 일도 없다.
+const DETAILED_COMMON_RULES = `당신은 생명공학·의약학 분야 대학원생을 돕는 논문 요약 도우미입니다.
+사용자 메시지로 페이지 번호가 붙은 논문 전문이 주어집니다.
 반드시 지켜야 할 규칙:
-1. 아래 사용자 메시지로 주어진 논문 텍스트에 없는 내용은 절대 추측해서 넣지 않는다 (환각 금지). 논문에 해당 정보가 없으면 그 항목에는 "논문에서 확인할 수 없습니다"라고 쓴다.
+1. 논문 텍스트에 없는 내용은 절대 추측해서 넣지 않는다 (환각 금지). 논문에 해당 정보가 없으면 "논문에서 확인할 수 없습니다"라고만 쓴다. 근거가 없는 내용으로 분량을 늘리는 것은 절대 금지다.
 2. 핵심 기술 용어·지표·약어·포맷 명칭은 한국어로 번역하지 않고 영어 원문 그대로 사용하고, 문장 구조만 자연스러운 한국어로 작성한다.
-3. 각 항목의 글자 수 제한은 없다.
-4. 아래 4개 항목 각각에 대해, 설명 문구를 그대로 베끼지 말고 실제 논문 내용을 바탕으로 작성한다:
-- keyTerms: 논문에서 가장 중요한 약어·포맷·기술적 개념 3~5가지를 선정해 각각을 정의
-- motivation: 저자들이 해결하려는 핵심 문제와 기존 연구(Baseline)의 한계
-- methodResults: 제안 방법론과 주요 실험 결과(구체적 수치·비교 우위 중심)
-- conclusion: 논문의 결론과 해당 분야(학계 또는 산업계)에 미치는 영향
-5. 다른 설명 없이 아래 형식의 JSON 객체 하나만 응답한다: {"keyTerms": string, "motivation": string, "methodResults": string, "conclusion": string}`;
+3. 글자 수 제한은 없다. 대학원 랩미팅 발표 자료로 바로 쓸 수 있을 만큼 깊이 있고 전문적으로, 충분히 길게 쓴다. 논문에 근거가 있는 내용은 뭉개지 말고 구체적인 수치·조건·실험 설계까지 살린다.
+4. 제목이나 머리말을 붙이지 않고 본문만 쓴다. 마크다운 기호(**, ##, - 등)는 쓰지 않고 평문으로 쓴다.
+5. 문단을 나눌 때는 빈 줄로 구분한다.`;
 
-async function generateDetailedSummary(pagedText: string): Promise<DetailedSummary> {
+const DETAILED_SECTION_INSTRUCTIONS: Record<keyof DetailedSummary, string> = {
+  keyTerms: `이 논문을 이해하는 데 꼭 필요한 약어·포맷·기술적 개념을 5~8가지 선정해 정리하라.
+반드시 한 용어를 한 덩어리로 쓰고, 용어와 용어 사이는 빈 줄로 구분해 눈으로 바로 구분되게 한다.
+각 덩어리는 "용어 (풀네임): 정의" 형식으로 시작한다.
+정의는 일반적인 뜻에서 그치지 말고, 이 논문에서 그 용어가 어떤 역할을 하는지까지 2~3문장으로 설명한다.
+용어 이름과 기술 용어만 영어로 남기고, 정의를 설명하는 문장은 반드시 한국어로 작성한다. 논문이 영어로 쓰였다고 해서 정의를 영어로 쓰지 않는다.`,
+  motivation: `저자들이 해결하려는 핵심 문제가 무엇인지 서술하라.
+기존 연구(Baseline)의 구체적인 한계를 수치와 함께 짚고, 그 한계가 왜 문제인지 설명한다.
+이 연구가 그 공백을 어떻게 겨냥하는지까지 이어서 쓴다.
+논문에 근거가 충분하다면 2문단 이상으로 나눠 쓴다.`,
+  methodResults: `제안 방법론의 동작 원리를 단계적으로 설명하라.
+이어서 실험 설계(대상·조건·반복 횟수·통계 처리 등)를 구체적으로 밝히고,
+주요 결과를 구체적인 수치와 Baseline 대비 비교 우위 중심으로 서술한다.
+논문이 스스로 밝힌 한계나 실패 사례, 대조군 결과도 있으면 함께 쓴다.
+논문에 근거가 충분하다면 2문단 이상으로 나눠 쓴다.`,
+  conclusion: `논문의 결론을 서술하라.
+그 결론이 해당 분야(학계 또는 산업계)에 갖는 의미를 설명하고,
+후속 연구나 실제 응용으로 이어질 수 있는 지점까지 쓴다.
+논문이 밝힌 한계가 향후 과제와 연결된다면 그것도 함께 다룬다.
+논문에 근거가 충분하다면 2문단 이상으로 나눠 쓴다.`,
+};
+
+async function generateSection(
+  instruction: string,
+  pagedText: string,
+): Promise<string> {
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: DETAILED_SUMMARY_SYSTEM_PROMPT },
+      { role: "system", content: `${DETAILED_COMMON_RULES}\n\n[이번에 작성할 항목]\n${instruction}` },
       { role: "user", content: pagedText },
     ],
     max_tokens: 2000,
   });
 
-  const raw = completion.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(raw) as Partial<DetailedSummary>;
+  return completion.choices[0]?.message?.content?.trim() ?? "";
+}
 
-  return {
-    keyTerms: parsed.keyTerms ?? "",
-    motivation: parsed.motivation ?? "",
-    methodResults: parsed.methodResults ?? "",
-    conclusion: parsed.conclusion ?? "",
-  };
+async function generateDetailedSummary(pagedText: string): Promise<DetailedSummary> {
+  const [keyTerms, motivation, methodResults, conclusion] = await Promise.all([
+    generateSection(DETAILED_SECTION_INSTRUCTIONS.keyTerms, pagedText),
+    generateSection(DETAILED_SECTION_INSTRUCTIONS.motivation, pagedText),
+    generateSection(DETAILED_SECTION_INSTRUCTIONS.methodResults, pagedText),
+    generateSection(DETAILED_SECTION_INSTRUCTIONS.conclusion, pagedText),
+  ]);
+
+  return { keyTerms, motivation, methodResults, conclusion };
 }
 
 export async function POST(request: Request) {
