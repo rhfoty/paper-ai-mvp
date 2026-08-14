@@ -129,7 +129,10 @@ export async function POST(request: Request) {
     const result = await parser.getText();
     await parser.destroy();
     pages = result.pages;
-  } catch {
+  } catch (error) {
+    // 사용자에게는 안내 문구만 보여주되, 원인은 서버 로그에 남긴다.
+    // (worker 파일 누락처럼 배포 환경에서만 재현되는 문제를 추적하기 위함)
+    console.error("PDF 텍스트 추출 실패:", error);
     return NextResponse.json(
       { message: "텍스트 추출이 불가능한 파일입니다" },
       { status: 422 },

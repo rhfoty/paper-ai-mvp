@@ -90,5 +90,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 기술 트러블슈팅 노트 (반복 방지)
 
 - `pdf-parse`처럼 `pdfjs-dist` 기반이라 워커 파일을 쓰는 라이브러리를 서버 코드(API 라우트)에서 쓸 때는 `next.config.ts`의 `serverExternalPackages`에 등록한다. 등록하지 않으면 번들링 과정에서 워커 파일 경로를 못 찾아 "Setting up fake worker failed" 오류가 난다.
+- `serverExternalPackages`에 등록하는 것만으로는 **배포 환경에서 부족하다.** 등록하면 번들링은 피하지만, Next.js 파일 트레이싱(`@vercel/nft`)은 `try/catch` 안의 동적 require를 감지하지 못해 필요한 파일이 배포 함수에서 빠진다. `pdf-parse`의 경우 ① `@napi-rs/canvas`(pdfjs-dist가 `DOMMatrix`를 폴리필하는 optional dependency)가 빠지면 모듈 로드 시점에 `ReferenceError: DOMMatrix is not defined`로 죽어 GET은 500, 본문 있는 POST는 Vercel 엣지에서 413 `FUNCTION_PAYLOAD_TOO_LARGE`로 나타난다. ② `pdfjs-dist`의 `pdf.worker.mjs`·`standard_fonts`·`cmaps`가 빠지면 파싱이 실패해 정상 PDF인데도 "텍스트 추출이 불가능한 파일입니다"로 잘못 안내된다. 둘 다 `next.config.ts`의 `outputFileTracingIncludes`로 강제 포함해야 한다. **로컬은 `node_modules`가 그대로 있어 절대 재현되지 않으므로, 배포 후 실제 요청으로 확인해야 한다.**
+- 배포 환경 디버깅은 `vercel logs <도메인>`으로 런타임 로그를 본다. 단, `catch {}`로 예외를 삼키면 로그에도 안 남으니 사용자 안내 문구를 반환하는 catch에는 `console.error`를 함께 남긴다.
+- `npm install --no-save`로 설치한 CLI(예: `vercel`)는 이후 다른 `npm install`을 실행하면 사라진다. 배포 직전에 `ls node_modules/.bin/vercel`로 확인한다.
+- Vercel CLI의 `vercel deploy`는 **`.gitignore`를 따르지 않는다.** `.vercelignore`를 따로 두지 않으면 `.env`와 로컬 작업 폴더(`.bkit` 등)까지 배포 소스로 업로드된다. 비밀 파일은 `.gitignore`와 `.vercelignore` **양쪽에** 등록한다.
 - 브라우저로 직접 실행 확인할 때는 dev 서버와 같은 origin인 `localhost`로 접속한다. `127.0.0.1`로 접속하면 정적 청크가 403으로 막혀 화면이 있는데도 안 되는 것처럼 보일 수 있다.
 - 다른 폴더의 `node_modules`를 그대로 옮겨써야 할 때는 `cp -r` 대신 `npm install`로 새로 설치한다. `cp`는 `node_modules/.bin`의 실행 파일 연결이 깨져 `next: command not found` 같은 오류를 일으킬 수 있다.
